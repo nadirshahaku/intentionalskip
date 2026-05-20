@@ -1,0 +1,561 @@
+// This file is part of Moodle - http://moodle.org/
+//
+// Moodle is free software: you can redistribute it and/or modify
+// it under the terms of the GNU General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+/**
+ * Learner UI for intentional skip tracking.
+ *
+ * @module     quizaccess_intentionalskip/intentionalskip
+ * @copyright  2026 Aga Khan University
+ * @license    http://www.gnu.org/copyleft/gpl.html GNU GPL v3 or later
+ */
+define(['core/ajax', 'core/notification'], function(Ajax, Notification) {
+    const COMPONENT = 'quizaccess_intentionalskip';
+    let config = {};
+    let stateBySlot = {};
+    let submitting = false;
+
+    const getString = key => M.util.get_string(key, COMPONENT);
+
+    const call = (methodname, args) => Ajax.call([{methodname, args}])[0];
+
+    const isStaleClientError = error => {
+        return error && error.errorcode === 'errorstaleclient';
+    };
+
+    const showRefreshRequired = () => showChoiceDialog(
+        getString('refreshrequiredtitle'),
+        getString('refreshrequiredmessage'),
+        [
+            {value: 'back', label: getString('goback'), className: 'btn btn-primary'}
+        ]
+    );
+
+    const getSlotsFromForm = () => {
+        const slotsInput = document.querySelector('form#responseform input[name="slots"]');
+        if (!slotsInput || !slotsInput.value) {
+            return [];
+        }
+        return slotsInput.value.split(',').map(slot => parseInt(slot, 10)).filter(Boolean);
+    };
+
+    const getQuestionElement = slot => {
+        const candidates = Array.from(document.querySelectorAll('.que'));
+        return candidates.find(candidate => {
+            return candidate.querySelector(`[name*=":${slot}_"], [id*=":${slot}_"], [for*=":${slot}_"]`);
+        }) || candidates[slot - 1] || null;
+    };
+
+    const getQuestionInputs = slot => {
+        const element = getQuestionElement(slot);
+        if (!element) {
+            return [];
+        }
+        return Array.from(element.querySelectorAll('input, textarea, select')).filter(input => {
+            if (input.closest('.quizaccess-intentionalskip-control')) {
+                return false;
+            }
+            if (input.type === 'hidden' || input.type === 'submit' || input.type === 'button') {
+                return false;
+            }
+            if (input.name && (input.name === 'slots' || input.name === 'sesskey')) {
+                return false;
+            }
+            return !input.disabled;
+        });
+    };
+
+    const slotHasLocalAnswer = slot => getQuestionInputs(slot).some(input => {
+        if (input.type === 'checkbox' || input.type === 'radio') {
+            return input.checked;
+        }
+        return String(input.value || '').trim() !== '';
+    });
+
+    const currentPageUnansweredSlots = () => getSlotsFromForm().filter(slot => !slotHasLocalAnswer(slot));
+
+    const currentPageAnsweredSkippedSlots = () => getSlotsFromForm().filter(slot => {
+        const checkbox = document.querySelector(`[data-intentionalskip-checkbox="${slot}"]`);
+        return checkbox && checkbox.checked && slotHasLocalAnswer(slot);
+    });
+
+    const setStatus = (slot, text, statusClass) => {
+        const status = document.querySelector(`[data-intentionalskip-status="${slot}"]`);
+        if (!status) {
+            return;
+        }
+        status.textContent = text;
+        status.className = `quizaccess-intentionalskip-status ${statusClass || ''}`.trim();
+    };
+
+    const setChecked = (slot, checked) => {
+        const checkbox = document.querySelector(`[data-intentionalskip-checkbox="${slot}"]`);
+        if (checkbox) {
+            checkbox.checked = checked;
+        }
+    };
+
+    const saveSlot = (slot, isskipped, source) => {
+        setStatus(slot, getString('markedasskippedsaving'), 'text-muted');
+        return call('quizaccess_intentionalskip_save_slot', {
+            attemptid: config.attemptid,
+            cmid: config.cmid,
+            slot,
+            isskipped,
+            source,
+            clientversion: config.clientversion
+        }).then(result => {
+            stateBySlot[slot] = Object.assign({}, stateBySlot[slot] || {}, {
+                skipped: result.skipped,
+                source: result.source,
+                timemodified: result.timemodified
+            });
+            setChecked(slot, result.skipped);
+            setStatus(slot, getString('markedasskippedsaved'), 'text-success');
+            return result;
+        }).catch(error => {
+            const message = isStaleClientError(error)
+                ? getString('refreshrequiredtitle')
+                : getString('markedasskippednotsaved');
+            setStatus(slot, message, 'text-danger');
+            throw error;
+        });
+    };
+
+    const markSlots = (slots, source, markall) => call('quizaccess_intentionalskip_mark_slots', {
+        attemptid: config.attemptid,
+        cmid: config.cmid,
+        slots,
+        source,
+        markall: !!markall,
+        clientversion: config.clientversion
+    });
+
+    const loadState = () => call('quizaccess_intentionalskip_get_state', {
+        attemptid: config.attemptid,
+        cmid: config.cmid,
+        clientversion: config.clientversion
+    }).then(result => {
+        stateBySlot = {};
+        result.slots.forEach(slotState => {
+            stateBySlot[slotState.slot] = slotState;
+        });
+        return result.slots;
+    });
+
+    const injectStyle = () => {
+        if (document.getElementById('quizaccess-intentionalskip-style')) {
+            return;
+        }
+        const style = document.createElement('style');
+        style.id = 'quizaccess-intentionalskip-style';
+        style.textContent = `
+            .quizaccess-intentionalskip-control {
+                margin: 1rem 0;
+                padding: .75rem 1rem;
+                border-left: 4px solid #0f6cbf;
+                background: #f8f9fa;
+            }
+            .quizaccess-intentionalskip-control label {
+                display: flex;
+                align-items: center;
+                gap: .5rem;
+                margin: 0;
+                font-weight: 600;
+            }
+            .quizaccess-intentionalskip-status {
+                display: block;
+                margin-left: 1.5rem;
+                font-size: .875rem;
+            }
+            .quizaccess-intentionalskip-backdrop {
+                position: fixed;
+                inset: 0;
+                z-index: 1050;
+                display: flex;
+                align-items: center;
+                justify-content: center;
+                background: rgba(0, 0, 0, .45);
+                padding: 1rem;
+            }
+            .quizaccess-intentionalskip-dialog {
+                max-width: 36rem;
+                width: 100%;
+                background: #fff;
+                border-radius: .5rem;
+                box-shadow: 0 1rem 3rem rgba(0, 0, 0, .25);
+            }
+            .quizaccess-intentionalskip-dialog-header,
+            .quizaccess-intentionalskip-dialog-body,
+            .quizaccess-intentionalskip-dialog-actions {
+                padding: 1rem;
+            }
+            .quizaccess-intentionalskip-dialog-header {
+                border-bottom: 1px solid #dee2e6;
+                font-weight: 700;
+            }
+            .quizaccess-intentionalskip-dialog-actions {
+                display: flex;
+                flex-wrap: wrap;
+                gap: .5rem;
+                justify-content: flex-end;
+                border-top: 1px solid #dee2e6;
+            }
+        `;
+        document.head.appendChild(style);
+    };
+
+    const showChoiceDialog = (title, message, buttons) => new Promise(resolve => {
+        const backdrop = document.createElement('div');
+        backdrop.className = 'quizaccess-intentionalskip-backdrop';
+        backdrop.setAttribute('role', 'dialog');
+        backdrop.setAttribute('aria-modal', 'true');
+
+        const dialog = document.createElement('div');
+        dialog.className = 'quizaccess-intentionalskip-dialog';
+        backdrop.appendChild(dialog);
+
+        const header = document.createElement('div');
+        header.className = 'quizaccess-intentionalskip-dialog-header';
+        header.textContent = title;
+        dialog.appendChild(header);
+
+        const body = document.createElement('div');
+        body.className = 'quizaccess-intentionalskip-dialog-body';
+        body.textContent = message;
+        dialog.appendChild(body);
+
+        const actions = document.createElement('div');
+        actions.className = 'quizaccess-intentionalskip-dialog-actions';
+        dialog.appendChild(actions);
+
+        const close = value => {
+            backdrop.remove();
+            resolve(value);
+        };
+
+        buttons.forEach(buttonConfig => {
+            const button = document.createElement('button');
+            button.type = 'button';
+            button.className = buttonConfig.className;
+            button.textContent = buttonConfig.label;
+            button.addEventListener('click', () => close(buttonConfig.value));
+            actions.appendChild(button);
+        });
+
+        document.body.appendChild(backdrop);
+        const firstButton = actions.querySelector('button');
+        if (firstButton) {
+            firstButton.focus();
+        }
+    });
+
+    const addSubmitIntentAndSubmit = (form, buttonName) => {
+        if (buttonName) {
+            const hidden = document.createElement('input');
+            hidden.type = 'hidden';
+            hidden.name = buttonName;
+            hidden.value = '1';
+            form.appendChild(hidden);
+        }
+        submitting = true;
+        HTMLFormElement.prototype.submit.call(form);
+    };
+
+    const confirmSkipTrackingUnavailable = (submitLabel) => showChoiceDialog(
+        getString('skiptrackingunavailabletitle'),
+        getString('skiptrackingunavailablemessage'),
+        [
+            {value: 'back', label: getString('goback'), className: 'btn btn-secondary'},
+            {value: 'continue', label: submitLabel, className: 'btn btn-primary'}
+        ]
+    );
+
+    const confirmAnsweredSkipped = () => showChoiceDialog(
+        getString('answeredandskippedtitle'),
+        getString('answeredandskippedmessage'),
+        [
+            {value: 'back', label: getString('goback'), className: 'btn btn-secondary'},
+            {value: 'clear', label: getString('clearskipandcontinue'), className: 'btn btn-primary'}
+        ]
+    );
+
+    const clearAnsweredSkippedSlots = slots => Promise.all(slots.map(slot => {
+        setChecked(slot, false);
+        return saveSlot(slot, false, 'auto_cleared_after_answer');
+    }));
+
+    const handleNavigation = event => {
+        if (submitting) {
+            return;
+        }
+
+        const button = event.target.closest('input[type="submit"], button[type="submit"]');
+        if (!button || !button.closest('form#responseform')) {
+            return;
+        }
+
+        const isNext = button.name === 'next' || button.id === 'mod_quiz-next-nav';
+        const isPrevious = button.name === 'previous' || button.id === 'mod_quiz-prev-nav';
+        if (!isNext && !isPrevious) {
+            return;
+        }
+
+        if (isPrevious || !config.warnonnext) {
+            return;
+        }
+
+        const unanswered = currentPageUnansweredSlots();
+        if (unanswered.length === 0) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        const choices = [
+            {value: 'back', label: getString('goback'), className: 'btn btn-secondary'},
+            {value: 'mark', label: getString('markandcontinue'), className: 'btn btn-primary'}
+        ];
+        if (config.allowcontinue) {
+            choices.push({
+                value: 'continue',
+                label: getString('continuewithoutmarking'),
+                className: 'btn btn-secondary'
+            });
+        }
+
+        showChoiceDialog(getString('nextunansweredtitle'), getString('nextunansweredmessage'), choices)
+            .then(choice => {
+                if (choice === 'mark') {
+                    return markSlots(unanswered, 'next_page_confirmation', false)
+                        .then(() => choice)
+                        .catch(error => {
+                            if (isStaleClientError(error)) {
+                                return showRefreshRequired().then(() => 'back');
+                            }
+                            return confirmSkipTrackingUnavailable(getString('continuewithoutmarking'));
+                        });
+                }
+                return choice;
+            })
+            .then(choice => {
+                if (choice === 'mark' || choice === 'continue') {
+                    addSubmitIntentAndSubmit(button.closest('form'), 'next');
+                }
+            })
+            .catch(Notification.exception);
+    };
+
+    const continueFinalSubmit = button => {
+        loadState().then(slots => {
+            const unanswered = slots.filter(slot => !slot.answered).map(slot => slot.slot);
+            const submit = () => markSlots([], 'final_submit_confirmation', true)
+                .then(() => addSubmitIntentAndSubmit(button.closest('form'), ''));
+
+            if (unanswered.length === 0) {
+                submit();
+                return;
+            }
+
+            showChoiceDialog(getString('finalunansweredtitle'), getString('finalunansweredmessage'), [
+                {value: 'back', label: getString('goback'), className: 'btn btn-secondary'},
+                {value: 'submit', label: getString('submitandmarkskipped'), className: 'btn btn-primary'}
+            ]).then(choice => {
+                if (choice !== 'submit') {
+                    return;
+                }
+                return submit();
+            }).catch(error => {
+                if (isStaleClientError(error)) {
+                    showRefreshRequired();
+                    return;
+                }
+                confirmSkipTrackingUnavailable(getString('submitwithoutmarking')).then(choice => {
+                    if (choice === 'continue') {
+                        addSubmitIntentAndSubmit(button.closest('form'), '');
+                    }
+                }).catch(Notification.exception);
+            });
+        }).catch(error => {
+            if (isStaleClientError(error)) {
+                showRefreshRequired();
+                return;
+            }
+            confirmSkipTrackingUnavailable(getString('submitwithoutmarking')).then(choice => {
+                if (choice === 'continue') {
+                    addSubmitIntentAndSubmit(button.closest('form'), '');
+                }
+            }).catch(Notification.exception);
+        });
+    };
+
+    const handleFinalSubmit = event => {
+        if (submitting) {
+            return;
+        }
+
+        const button = event.target.closest('.path-mod-quiz .btn-finishattempt button');
+        if (!button) {
+            return;
+        }
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+
+        const answeredSkipped = currentPageAnsweredSkippedSlots();
+        if (answeredSkipped.length > 0) {
+            confirmAnsweredSkipped().then(choice => {
+                if (choice !== 'clear') {
+                    return;
+                }
+                return clearAnsweredSkippedSlots(answeredSkipped)
+                    .then(() => continueFinalSubmit(button));
+            }).catch(error => {
+                if (isStaleClientError(error)) {
+                    showRefreshRequired();
+                    return;
+                }
+                Notification.exception(error);
+            });
+            return;
+        }
+
+        continueFinalSubmit(button);
+    };
+
+    const injectControls = slots => {
+        if (!config.showcheckbox) {
+            return;
+        }
+
+        slots.forEach(slotState => {
+            const slot = slotState.slot;
+            const question = getQuestionElement(slot);
+            if (!question || question.querySelector('.quizaccess-intentionalskip-control')) {
+                return;
+            }
+
+            const control = document.createElement('div');
+            control.className = 'quizaccess-intentionalskip-control';
+
+            if (config.readonly) {
+                control.textContent = slotState.skipped
+                    ? getString('markedasskipped')
+                    : getString('notmarkedasskipped');
+                question.appendChild(control);
+                return;
+            }
+
+            const label = document.createElement('label');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.checked = !!slotState.skipped;
+            checkbox.dataset.intentionskipCheckbox = slot;
+            checkbox.setAttribute('data-intentionalskip-checkbox', slot);
+            label.appendChild(checkbox);
+            label.appendChild(document.createTextNode(getString('markasskipped')));
+
+            const status = document.createElement('span');
+            status.setAttribute('data-intentionalskip-status', slot);
+            status.className = 'quizaccess-intentionalskip-status text-muted';
+            status.textContent = slotState.skipped ? getString('markedasskippedsaved') : '';
+
+            control.appendChild(label);
+            control.appendChild(status);
+            question.appendChild(control);
+
+            checkbox.addEventListener('change', () => {
+                const source = checkbox.checked ? 'manual_checkbox' : 'manual_uncheck';
+                if (checkbox.checked && slotHasLocalAnswer(slot)) {
+                    checkbox.checked = false;
+                    setStatus(slot, '', 'text-muted');
+                    confirmAnsweredSkipped();
+                    return;
+                }
+                if (config.ajaxsave) {
+                    saveSlot(slot, checkbox.checked, source).catch(error => {
+                        if (isStaleClientError(error)) {
+                            showRefreshRequired();
+                            return;
+                        }
+                        Notification.exception(error);
+                    });
+                }
+            });
+
+            getQuestionInputs(slot).forEach(input => {
+                input.addEventListener('change', () => {
+                    if (checkbox.checked && slotHasLocalAnswer(slot)) {
+                        saveSlot(slot, false, 'auto_cleared_after_answer').catch(error => {
+                            if (isStaleClientError(error)) {
+                                showRefreshRequired();
+                                return;
+                            }
+                            Notification.exception(error);
+                        });
+                    }
+                });
+            });
+        });
+    };
+
+    const enhanceSummary = slots => {
+        slots.forEach(slotState => {
+            const row = document.querySelector(`.quizsummary${slotState.slot}`);
+            if (!row || row.children.length < 2) {
+                return;
+            }
+
+            if (slotState.answered) {
+                return;
+            }
+
+            row.children[1].textContent = slotState.skipped
+                ? getString('markedasskipped')
+                : getString('blanknotconfirmed');
+        });
+    };
+
+    const registerEvents = () => {
+        document.addEventListener('click', handleNavigation, true);
+        document.addEventListener('click', handleFinalSubmit, true);
+    };
+
+    const init = initialConfig => {
+        config = Object.assign({
+            cmid: 0,
+            attemptid: 0,
+            clientversion: 0,
+            readonly: false,
+            showcheckbox: true,
+            warnonnext: true,
+            allowcontinue: true,
+            ajaxsave: true
+        }, initialConfig || {});
+
+        if (!config.attemptid || !config.cmid) {
+            return;
+        }
+
+        injectStyle();
+        loadState().then(slots => {
+            injectControls(slots);
+            enhanceSummary(slots);
+            registerEvents();
+        }).catch(error => {
+            if (isStaleClientError(error)) {
+                showRefreshRequired();
+                return;
+            }
+            Notification.exception(error);
+        });
+    };
+
+    return {
+        init: init
+    };
+});
