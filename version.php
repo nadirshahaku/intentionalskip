@@ -25,7 +25,7 @@
 defined('MOODLE_INTERNAL') || die();
 
 $plugin->component = 'quizaccess_intentionalskip';
-$plugin->version = 2026051906;
+$plugin->version = 2026051907;
 $plugin->requires = 2024100700;
 $plugin->maturity = MATURITY_ALPHA;
 $plugin->release = '0.1.0';

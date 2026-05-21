@@ -55,6 +55,9 @@ define(['core/ajax', 'core/notification'], function(Ajax, Notification) {
             return [];
         }
         return Array.from(element.querySelectorAll('input, textarea, select')).filter(input => {
+            if (input.matches('[data-intentionalskip-checkbox]')) {
+                return false;
+            }
             if (input.closest('.quizaccess-intentionalskip-control')) {
                 return false;
             }
@@ -68,7 +71,10 @@ define(['core/ajax', 'core/notification'], function(Ajax, Notification) {
         });
     };
 
-    const slotHasLocalAnswer = slot => getQuestionInputs(slot).some(input => {
+    const slotHasLocalAnswer = (slot, ignoredInput = null) => getQuestionInputs(slot).some(input => {
+        if (ignoredInput && input === ignoredInput) {
+            return false;
+        }
         if (input.type === 'checkbox' || input.type === 'radio') {
             return input.checked;
         }
@@ -470,7 +476,7 @@ define(['core/ajax', 'core/notification'], function(Ajax, Notification) {
 
             checkbox.addEventListener('change', () => {
                 const source = checkbox.checked ? 'manual_checkbox' : 'manual_uncheck';
-                if (checkbox.checked && slotHasLocalAnswer(slot)) {
+                if (checkbox.checked && slotHasLocalAnswer(slot, checkbox)) {
                     checkbox.checked = false;
                     setStatus(slot, '', 'text-muted');
                     confirmAnsweredSkipped();
